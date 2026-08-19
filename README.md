@@ -4,6 +4,10 @@ A collection of [Claude Code](https://docs.claude.com/en/docs/claude-code) skill
 commands, and hook scripts I built to run an AI-native software development loop — spec-first
 planning, parallel multi-agent builds, and a gated review/merge process.
 
+> **Start here:** [**GUIDE.md**](GUIDE.md) is the full, nuanced walkthrough — the philosophy behind
+> the loop and exactly how to drive every skill, command, and hook. This README is the map; the guide
+> is the manual.
+
 They're split into two folders by where they're meant to run:
 
 | Folder | Use it for | Coupling |
