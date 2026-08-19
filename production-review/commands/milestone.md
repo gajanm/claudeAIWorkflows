@@ -1,0 +1,230 @@
+---
+name: milestone
+description: Orchestrate one cycle of the MOSAIC dev self-loop — read PROJECT_PLAN.md, scope the next milestone into an OpenSpec change, provision packages, and hand off to /opsx:propose. `/milestone status` prints the day-view board; `/milestone plan` proposes a parallel lane set (approve/deny) then generates a one-command launcher. Milestones pipeline (start N+1 while N is in review).
+---
+
+Drive the MOSAIC self-loop. This command reads the milestone board, scopes the target
+milestone, provisions its packages, pulls its spec sections, and hands off to planning.
+
+**Key files:**
+- Milestone board (source of truth for status): `/Volumes/workplace/PROJECT_PLAN.md`
+- Design detail: `/Volumes/workplace/mosaic_project_specs.md` (load via `/spec`, never wholesale)
+- Per-change tracking: `/Volumes/workplace/openspec/changes/<name>/`
+- Parallel lanes ledger: `/Volumes/workplace/openspec/LANES.md` (which lane edits which packages → worktree isolation)
+- Package → version-set map + APS/brazil facts: recalled from memory (`mosaic-workspace-packages`, `aps-personal-stack-state`).
+
+**Status semantics (hard rule):** a milestone's Status column flips to 🟢 **only when its
+revised CR is FULLY APPROVED and merged** (gate #5). While work is in flight it is 🟡. Never
+mark 🟢 on "code done" or "CR published". Starting the next milestone is NOT gated — milestones
+pipeline (milestone N can be in review while N+1 is in build).
+
+---
+
+## Mode A — `/milestone status` (read-only day-view board)
+
+1. Read `PROJECT_PLAN.md`; read the `Milestone · CR · Status` header line of every
+   `openspec/changes/*/proposal.md`.
+2. Print a board grouped by phase:
+   ```
+   ## Self-loop board
+
+   In review (CR open):
+   - <milestone> — CR-xxxxxxxx (🔴 N re-review / 🔵 N reply)   ← run /my-crs
+   In build:
+   - <milestone> — change <name>, not yet CR'd
+   Queued (proposed, not started):
+   - <milestone> — change <name>
+   Next up (not started in PLAN):
+   - <milestone row>
+   ```
+3. Also read `openspec/LANES.md` and print the active parallel lanes below the board:
+   ```
+   Active lanes (concurrent build):
+   - <lane> — pkgs <…> — session <name> — worktree <path or base ws> — merge-after: <depends-on or none>
+   ```
+   Flag two problems if present: (a) two active lanes that share a package but where the newer one
+   still shows worktree `—` (an un-isolated collision — fix before both build); (b) a lane whose
+   **Depends-on** lane has NOT merged yet but this lane is ready to merge (merge-order violation —
+   its dependency must merge first at Gate 5).
+4. Stop. This mode never writes anything.
+
+---
+
+## Mode P — `/milestone plan` (propose a parallel lane set, then generate a launcher)
+
+Plan which milestones can run **in parallel right now**, let the user approve a subset, then emit a
+one-command launch script. The user should NOT have to name lanes or pick directories — derive it
+all.
+
+### P1 — Gather candidates  [auto, read-only]
+- Read `PROJECT_PLAN.md`; take all **non-🟢** rows as candidates (skip Complete).
+- Read `openspec/LANES.md` for already-active lanes (don't re-propose those).
+
+### P2 — Resolve each candidate  [auto, read-only]
+For every candidate, apply Step 2 logic to derive:
+- **change name** (= lane name; kebab-case, no prefix — e.g. `sign-off-ddb-schema`),
+- **packages** touched,
+- **start-dir**: the single package's dir if one package (e.g.
+  `SpiMosaicVending/src/SpiMosaicSelectionVending`); the workspace root if it spans several or is
+  ambiguous.
+
+### P3 — Compute the collision + dependency graph  [auto]
+Across the candidate set (plus active lanes):
+- **Package collision** → two candidates share a package. The later one needs a worktree of that
+  package; mark its start-dir as `worktrees/<lane>/<Pkg>`.
+- **Depends-on** → if candidate B consumes A's output (B imports/references what A creates), B must
+  merge after A. If they'd run concurrently, still fine (worktree-isolated) — but flag the
+  merge-order.
+- **Hard sequential** → if B literally can't build until A exists (rare), mark B **deferred** (don't
+  launch yet).
+
+### P4 — Propose the set  🟡 approve/deny
+Present a **multi-select** via **AskUserQuestion**: one option per launchable candidate, labeled
+with name → start-dir → (base ws | WORKTREE, collides w/ X | merge-after: Y). List deferred ones
+separately as "not launchable yet (reason)". The user checks which lanes they want.
+
+### P5 — Prepare + emit launcher  [writes: LANES.md, worktrees, launch script]
+For each approved lane:
+- If it needs a worktree, create it (`git worktree add` — auto-allowed).
+- Append its row to `openspec/LANES.md` (name, packages, worktree, depends-on, session=name, CR pending).
+Then write `/Volumes/workplace/.claude/launch-lanes.sh`. It must create **every** lane window with
+`--no-attach` (so creation never blocks), then attach **once** at the end. e.g.:
+```bash
+#!/bin/bash
+# Generated by /milestone plan — launches approved parallel lanes into the `mosaic` tmux session.
+~/.claude/scripts/lane.sh sign-off-ddb-schema        SpiMosaicVending/src/SpiMosaicSelectionVending --no-attach
+~/.claude/scripts/lane.sh sign-off-smithy-operations SpiMosaic/src/SpiMosaicServiceModel            --no-attach
+# All windows created; attach once (switch if already inside tmux).
+if [ -n "${TMUX:-}" ]; then tmux switch-client -t mosaic; else tmux attach-session -t mosaic; fi
+```
+Tell the user to run it: **`!bash .claude/launch-lanes.sh`** (creates all approved lanes, then
+attaches you to the `mosaic` session). Inside each lane window they then run `/milestone <name>` to
+drive that lane's build. If they're already in a `mosaic` session, the new windows just appear.
+
+### P6 — Stop.
+Do not drive the lanes' builds from this session — that happens inside each lane's own session.
+
+---
+
+## Mode B — `/milestone [name]` (start / advance a milestone cycle)
+
+### Step 1 — Pick the target milestone  [auto, read-only]
+- Read `PROJECT_PLAN.md` and parse the table.
+- If a name/row was given, use it. Otherwise list the non-🟢 rows and, if more than one is
+  a reasonable "next", use **AskUserQuestion** to let the user pick (pipelining means "next"
+  isn't always the topmost row).
+
+### Step 2 — Extract scope from the Description column  [auto, read-only]
+- The row's **Description** column is the authoritative relevance signal. It already names the
+  packages, files, and design topics (e.g. "add `CreateSignOff` to `vending.smithy`… `SIGNOFF_TRACKER`…").
+- Derive: (a) the set of **spec topics** to load, (b) the **packages** touched, (c) a kebab-case
+  **change name**.
+- **The change name IS the lane name.** Do not invent a separate session name or add a
+  pipeline/stack prefix (no `guv-`/`dis-`). The kebab-case change name (e.g. `sign-off-ddb-schema`)
+  is used verbatim for: the `openspec/changes/<name>/` folder, the `LANES.md` row, `claude --name`,
+  the tmux window, and notifications — one identity everywhere. Derive it from the milestone's
+  intent, not from the stack.
+
+### Step 3 — Load the relevant spec sections  [auto, read-only]
+- Call `/spec <topic1> <topic2> ...` with ALL topics from step 2 at once. Do not load sequentially
+  and do not load the whole spec.
+
+### Step 4 — Provision packages  [auto for existing; GATED for new]
+- Run `brazil ws show` to see what's checked out.
+- For each package the milestone needs that is **missing**:
+  - **In a known version set** (per the package→VS memory map) → run
+    `brazil ws use --package <Pkg> --versionset <VS>` then `brazil ws sync --md`.  [auto]
+  - **Needs a version-set merge** (`brazil vs merge … --addNewPackage …`) → 🟡 **soft gate**:
+    show the exact command, get a yes, then run + `brazil ws sync --md`.
+  - **Does not exist yet** (brand-new package, e.g. a "(set up)" row) → 🔴 **hard gate**: STOP.
+    Tell the user this package must be created (BuilderHub Create) — do not attempt to invent it.
+
+### Step 4b — Lane isolation check (parallel milestones)  [auto; worktree creation GATED]
+Milestones pipeline, so more than one may be **in build** at once. Isolation is keyed on the
+**package**, not the milestone (each Brazil package is its own git repo; the workspace root is not).
+
+Every lane works on its **own feature branch named `<change-name>`** (never directly on `mainline` —
+CRUX raises the CR from that branch). Branch = change name = lane name = window = ledger row.
+
+- Read `openspec/LANES.md`. Compute this lane's edited-package set (from step 2's Description).
+- **No overlap** with any active lane's packages → this lane builds in the **base workspace**. For
+  each package P it edits, create + checkout the feature branch (each Brazil package is its own
+  git repo, so this is per-package):
+  ```bash
+  cd src/P && git checkout -b <change-name> mainline
+  ```
+  (If the branch already exists from a prior run, `git checkout <change-name>` instead.) Worktree `—`.
+- **Overlap on package P** with an active lane → the incumbent keeps `src/P`; THIS lane gets a
+  worktree of P **on its own branch** so edits + `build/` + target don't collide. `git worktree add`
+  is **auto-allowed** (local + reversible, part of lane mechanics — not a gate); announce it, then
+  from inside the package repo — the `-b` creates the feature branch atomically with the worktree:
+  ```bash
+  cd src/P && git worktree add -b <change-name> ../../worktrees/<lane>/P mainline
+  ```
+  Build this lane from the worktree path. Note in the ledger row that both lanes resolve the same
+  `P/development` version set — fine for parallel *edits/builds*; flag it only if BOTH lanes are
+  changing P's dependencies at once.
+- **Set Depends-on:** on a package collision, decide whether this lane *consumes the incumbent's
+  output* (e.g. handlers import the `SignOffModel` the other lane creates; a construct references a
+  resource the other defines). If so, set this lane's **Depends-on** to the incumbent — that lane
+  must **merge first** (Gate 5), because merging auto-promotes to Beta and the dependency must land
+  ahead of the consumer. Independent edits to the same package → leave Depends-on empty.
+- **Freshness — build on the latest** (run once the branch exists, and periodically during a long
+  lane). Two axes of "latest," do both:
+  ```bash
+  # git: rebase the lane's feature branch onto the newest mainline (from inside src/P or the worktree)
+  git fetch origin && git pull --rebase origin mainline
+  # version set: sync workspace metadata to the latest VS revision
+  brazil ws sync --md
+  ```
+  Rebase (not merge) keeps the lane's history linear — matches the one-commit-per-CR rule. On
+  conflicts: resolve in-package → `git add` → `git rebase --continue`. If deps moved, follow with
+  `brazil-build clean && brazil-build release`. (See `BRAZIL_COMMAND_REFERENCE.md`.)
+- **Append a row to `openspec/LANES.md`** for this lane: change name, milestone, packages,
+  worktree (`—` or the path), depends-on (`—` or change names), session name (= the change name;
+  suggest `claude --name <change-name>` or `lane.sh <change-name> <dir>`), CR `_(pending)_`.
+- **Deploy is serialized:** if this lane will `aps deploy` (CDK-infra testing on your personal
+  stack only), remind the user only one deploy runs at a time — Gate 2 + `.claude/deploy.lock`
+  enforce it. **Beta is automatic on merge** (Gate 5), not a manual deploy.
+
+### Step 5 — 🔴 GATE #1: approve the plan
+- Summarize: target milestone, change name, spec sections loaded, packages provisioned, and the
+  intended approach. Get explicit approval before ANY code is written.
+
+### Step 6 — Hand off to OpenSpec  [writes openspec/changes/]
+- Run `/opsx:propose <change-name>`, feeding it the milestone description + loaded spec sections
+  as the scoping context.
+- After the proposal exists, ensure `openspec/changes/<name>/proposal.md` carries a header line:
+  ```
+  > **Milestone:** <plan row Objective — Milestone>  ·  **CR:** _(pending)_  ·  **Status:** proposed
+  ```
+  (The CR field is filled in later when the CR is created; this header is how `/milestone status`
+  and `/my-crs` correlate change ↔ milestone ↔ CR.)
+
+### Step 7 — Reflect status in the board  [writes PROJECT_PLAN.md]
+- Set the milestone's Status to 🟡 In Progress (from 🔘). **Do NOT set 🟢** — that only happens
+  after the CR is fully approved and merged.
+
+### Step 8 — Point to the next action
+- Tell the user: "Proposal ready. Run `/opsx:apply` to build, or `/milestone` again to start the
+  next milestone in parallel." Remind them the deploy leg (`aps deploy`) activates only for
+  milestones that touch CDK/deployable resources.
+
+---
+
+## Downstream reference (not run by this command, but the cycle it belongs to)
+
+- BUILD: `/opsx:apply` → `brazil-build release`. If the milestone touches CDK: 🔴 gate → `aps deploy`
+  (full CloudFormation, no hotswap) to the right personal stack (`gajanmoh-guv` for SpiMosaicVending,
+  `gajanmoh-dis` for SpiMosaic) with the matching `--profile`, then verify.
+  - **Fan-out within a lane (Option B):** when `tasks.md` has independent sub-tasks (e.g. one test
+    suite per Lambda — `sign_off_lambda_handler`, `completion_handler`, `get_sign_off_status`,
+    `checker`; or CDK jest tests vs Python unit tests), dispatch a sub-agent per independent slice so
+    they build concurrently, then merge. Sub-agents inherit this lane's gates. Skip fan-out for
+    sequential/coupled work (e.g. a single Smithy operation).
+- REVIEW: `crux-review` (self) → `crux-author` → 🔴 gate create+publish CR. Update proposal.md's CR field.
+- RESPOND: `/my-crs` services all open CRs across milestones.
+- CLOSE: before merging, check `openspec/LANES.md` — if this lane has a **Depends-on**, that lane
+  must be merged FIRST (merge auto-promotes to Beta; the dependency must land ahead of the consumer).
+  Then 🔴 merge → `/opsx:archive <name>` → remove this lane's row from `openspec/LANES.md` and, if it
+  used a worktree, `git worktree remove` it (🟡 `ask` gate) → THEN flip PLAN Status to 🟢.

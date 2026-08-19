@@ -1,0 +1,14 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+
+# Editor / local
+*.swp
+.idea/
+.vscode/
+
+# Claude Code runtime junk (never commit)
+*.log
